@@ -12,7 +12,7 @@ use cgmath::angle;
 use cgmath::array::Array2;
 use cgmath::matrix::{Matrix, Matrix3, Matrix4};
 use cgmath::num::{BaseFloat};
-use cgmath::vector::{Vector, Vector2, Vector3};
+use cgmath::vector::{Vector, Vector2, Vector3, Vector4};
 use cgmath::projection;
 use piston::*;
 use gl::types::*;
@@ -373,6 +373,12 @@ impl Block {
       vtx(x2, y2, z1, c), vtx(x2, y2, z2, c),
     ]
   }
+
+  pub fn contains_point(&self, point: Vector3<GLfloat>) -> bool {
+    (self.low_corner.x <= point.x) && (point.x <= self.high_corner.x) &&
+    (self.low_corner.y <= point.y) && (point.y <= self.high_corner.y) &&
+    (self.low_corner.z <= point.z) && (point.z <= self.high_corner.z)
+  }
 }
 
 pub struct App {
@@ -465,6 +471,16 @@ pub fn from_axis_angle<S: BaseFloat>(axis: Vector3<S>, angle: angle::Rad<S>) -> 
         num::zero(),
         num::one(),
     )
+}
+
+#[inline]
+pub fn w_normalize<S: Div<S, S> + num::One>(v: Vector4<S>) -> Vector4<S> {
+  Vector4::new(
+    v.x / v.w,
+    v.y / v.w,
+    v.z / v.w,
+    num::one()
+  )
 }
 
 #[allow(non_snake_case_functions)]
@@ -594,7 +610,7 @@ impl Game<GameWindowSDL2> for App {
 
       gl::Enable(gl::DEPTH_TEST);
       gl::DepthFunc(gl::LESS);
-      gl::ClearDepth(100.0);
+      gl::ClearDepth(10.0);
       gl::ClearColor(0.0, 0.0, 0.0, 1.0);
 
       unsafe {
@@ -747,7 +763,7 @@ impl Game<GameWindowSDL2> for App {
       if self.is_mouse_pressed {
         time!(&self.timers, "update.delete_block", || unsafe {
           self
-            .block_at_screen(WINDOW_WIDTH as i32 / 2, WINDOW_HEIGHT as i32 / 2)
+            .block_at_screen(WINDOW_WIDTH as f32 / 2.0, WINDOW_HEIGHT as f32 / 2.0)
             .map(|block_index| {
               assert!(block_index < self.world_data.len());
               self.world_data.swap_remove(block_index);
@@ -908,9 +924,37 @@ impl App {
   }
 
   #[inline]
+  /// Calculate the projection matrix used for rendering.
+  fn projection_matrix(&self) -> Matrix4<GLfloat> {
+    self.fov_matrix * self.rotation_matrix * self.translation_matrix
+  }
+
+  #[inline]
+  /// Translate window coordinates to screen coordinates
+  fn to_screen_position(&self, x: GLfloat, y: GLfloat) -> Vector2<GLfloat> {
+    Vector2::new(
+      x as GLfloat * 2.0 / WINDOW_WIDTH as GLfloat - 1.0,
+      1.0 - y as GLfloat * 2.0 / WINDOW_HEIGHT as GLfloat,
+    )
+  }
+
+  #[inline]
+  /// Calculate the world coordinates corresponding to the given screen
+  /// coordinates.
+  fn unproject(&self, screen_position: Vector3<GLfloat>) -> Vector3<GLfloat> {
+    w_normalize(
+      self
+        .projection_matrix()
+        .invert()
+        .expect("projection matrix is uninvertible")
+        .mul_v(&screen_position.extend(1.0))
+    ).truncate()
+  }
+
+  #[inline]
   pub unsafe fn update_projection(&mut self) {
     time!(&self.timers, "update.projection", || {
-      self.set_projection(&(self.fov_matrix * self.rotation_matrix * self.translation_matrix));
+      self.set_projection(&self.projection_matrix());
     })
   }
 
@@ -922,18 +966,29 @@ impl App {
     })
   }
 
-  pub unsafe fn block_at_screen(&mut self, x: i32, y: i32) -> Option<uint> {
-      self.render_selection();
+  pub unsafe fn block_at_screen(&mut self, x: GLfloat, y: GLfloat) -> Option<uint> {
+    time!(&self.timers, "block_at_screen", || {
+      let mut z = 0.0;
+      time!(&self.timers, "block_at_screen.read_pixels", || {
+        // TODO: should we round instead of (as i32)ing?
+        gl::ReadPixels(x as i32, y as i32, 1, 1, gl::DEPTH_COMPONENT, gl::FLOAT, mem::transmute(&z));
+      });
 
-      let pixels: Color4<u8> = Color4::new(0, 0, 0, 0);
-      gl::ReadPixels(x, y, 1, 1, gl::RGB, gl::UNSIGNED_BYTE, mem::transmute(&pixels));
+      let world_position = time!(&self.timers, "block_at_screen.unproject", || {
+        let screen_position = self.to_screen_position(x, y);
+        self.unproject(Vector3::new(screen_position.x, screen_position.y, z))
+      });
 
-      let block_index = (pixels.r as uint << 16) | (pixels.g as uint << 8) | (pixels.b as uint << 0);
-      if block_index == 0 {
+      time!(&self.timers, "block_at_screen.find_block", || {
+        // TODO: better iteration
+        for i in range(0, self.world_data.len()) {
+          if self.world_data[i].contains_point(world_position) {
+            return Some(i)
+          }
+        }
         None
-      } else {
-        Some(block_index - 1)
-      }
+      })
+    })
   }
 
   #[inline]
